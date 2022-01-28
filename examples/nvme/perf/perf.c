@@ -773,6 +773,8 @@ register_file(const char *path)
 		entry->seed = rand();
 		if (g_zipf_theta > 0) {
 			entry->zipf = spdk_zipf_create(entry->size_in_ios, g_zipf_theta, 0);
+		} else {
+		entry->zipf = NULL;
 		}
 	}
 
@@ -1305,6 +1307,8 @@ register_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns)
 		entry->seed = rand();
 		if (g_zipf_theta > 0) {
 			entry->zipf = spdk_zipf_create(entry->size_in_ios, g_zipf_theta, 0);
+		} else {
+			entry->zipf = NULL;
 		}
 	}
 
