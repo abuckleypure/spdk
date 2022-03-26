@@ -1469,8 +1469,14 @@ submit_single_io(struct perf_task *task)
 	struct ns_entry		*entry = ns_ctx->entry;
 
 	assert(!ns_ctx->is_draining);
+	if ((g_rw_percentage == 100) ||
+	    (g_rw_percentage != 0 && ((rand_r(&worker->seed) % 100) < g_rw_percentage))) {
+		task->is_read = true;
+	} else {
+		task->is_read = false;
+	}
 
-	if (entry->zipf) {
+	if (entry->zipf && task->is_read) {
 		offset_in_ios = spdk_zipf_generate(entry->zipf);
 	} else if (g_is_random) {
 		offset_in_ios = (((uint64_t)rand_r(&worker->seed) << 32) | (uint64_t)rand_r(&worker->seed)) % entry->size_in_ios;
@@ -1482,13 +1488,6 @@ submit_single_io(struct perf_task *task)
 	}
 
 	task->submit_tsc = spdk_get_ticks();
-
-	if ((g_rw_percentage == 100) ||
-	    (g_rw_percentage != 0 && ((rand_r(&worker->seed) % 100) < g_rw_percentage))) {
-		task->is_read = true;
-	} else {
-		task->is_read = false;
-	}
 
 	rc = entry->fn_table->submit_io(task, ns_ctx, entry, offset_in_ios);
 
