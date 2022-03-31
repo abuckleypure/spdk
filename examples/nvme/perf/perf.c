@@ -158,7 +158,8 @@ struct ns_worker_ctx {
 
 	TAILQ_HEAD(, perf_task)		queued_tasks;
 
-	struct spdk_histogram_data	*histogram;
+	struct spdk_histogram_data	*read_histogram;
+	struct spdk_histogram_data	*write_histogram;
 };
 
 struct worker_thread {
@@ -1534,7 +1535,11 @@ task_complete(struct perf_task *task)
 		ns_ctx->stats.max_tsc = tsc_diff;
 	}
 	if (spdk_unlikely(g_latency_sw_tracking_level > 0)) {
-		spdk_histogram_data_tally(ns_ctx->histogram, tsc_diff);
+		if (task->is_read) {
+			spdk_histogram_data_tally(ns_ctx->read_histogram, tsc_diff);
+		} else {
+			spdk_histogram_data_tally(ns_ctx->write_histogram, tsc_diff);
+		}
 	}
 
 	if (spdk_unlikely(entry->md_size > 0)) {
@@ -2072,7 +2077,10 @@ print_performance(void)
 			printf("Summary latency data for %-43.43s from core %u:\n", ns_ctx->entry->name, worker->lcore);
 			printf("=================================================================================\n");
 
-			spdk_histogram_data_iterate(ns_ctx->histogram, check_cutoff, &cutoff);
+			printf("Reads:\n");
+			spdk_histogram_data_iterate(ns_ctx->read_histogram, check_cutoff, &cutoff);
+			printf("Writes:\n");
+			spdk_histogram_data_iterate(ns_ctx->write_histogram, check_cutoff, &cutoff);
 
 			printf("\n");
 		}
@@ -2088,7 +2096,10 @@ print_performance(void)
 			printf("==============================================================================\n");
 			printf("       Range in us     Cumulative    IO count\n");
 
-			spdk_histogram_data_iterate(ns_ctx->histogram, print_bucket, NULL);
+			printf("Reads:\n");
+			spdk_histogram_data_iterate(ns_ctx->read_histogram, print_bucket, NULL);
+			printf("Writes:\n");
+			spdk_histogram_data_iterate(ns_ctx->write_histogram, print_bucket, NULL);
 			printf("\n");
 		}
 	}
@@ -2889,7 +2900,8 @@ unregister_workers(void)
 
 		TAILQ_FOREACH_SAFE(ns_ctx, &worker->ns_ctx, link, tmp_ns_ctx) {
 			TAILQ_REMOVE(&worker->ns_ctx, ns_ctx, link);
-			spdk_histogram_data_free(ns_ctx->histogram);
+			spdk_histogram_data_free(ns_ctx->read_histogram);
+			spdk_histogram_data_free(ns_ctx->write_histogram);
 			free(ns_ctx);
 		}
 
