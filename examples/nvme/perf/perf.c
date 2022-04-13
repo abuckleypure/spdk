@@ -81,7 +81,8 @@ struct ns_entry {
 	uint32_t		block_size;
 	uint32_t		md_size;
 	bool			md_interleave;
-	struct spdk_zipf	*zipf;
+	struct spdk_zipf	*zipf_read;
+	struct spdk_zipf	*zipf_write;
 	bool			pi_loc;
 	enum spdk_nvme_pi_type	pi_type;
 	uint32_t		io_flags;
@@ -258,7 +259,8 @@ static bool g_exit;
 static uint32_t g_keep_alive_timeout_in_ms = 10000;
 static bool g_continue_on_error = false;
 static uint32_t g_quiet_count = 1;
-static double g_zipf_theta;
+static double g_zipf_theta_read;
+static double g_zipf_theta_write;
 /* Set default io_queue_size to UINT16_MAX, NVMe driver will then reduce this
  * to MQES to maximize the io_queue_size as much as possible.
  */
@@ -776,11 +778,15 @@ register_file(const char *path)
 
 	if (g_is_random) {
 		entry->seed = rand();
-		if (g_zipf_theta > 0) {
-			entry->zipf = spdk_zipf_create(entry->size_in_ios, g_zipf_theta, rand());
+		if (g_zipf_theta_read > 0) {
+			entry->zipf_read = spdk_zipf_create(entry->size_in_ios, g_zipf_theta_read, rand());
 		} else {
-
-		entry->zipf = NULL;
+			entry->zipf_read = NULL;
+		}
+		if (g_zipf_theta_write > 0) {
+			entry->zipf_write = spdk_zipf_create(entry->size_in_ios, g_zipf_theta_write, rand());
+		} else {
+			entry->zipf_write = NULL;
 		}
 	}
 
@@ -1311,12 +1317,18 @@ register_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns)
 
 	if (g_is_random) {
 		entry->seed = rand();
-		if (g_zipf_theta > 0) {
-			entry->zipf = spdk_zipf_create(entry->size_in_ios, g_zipf_theta, rand());
+		if (g_zipf_theta_read > 0) {
+			entry->zipf_read = spdk_zipf_create(entry->size_in_ios, g_zipf_theta_read, rand());
 		} else {
-			entry->zipf = NULL;
+			entry->zipf_read = NULL;
+		}
+		if (g_zipf_theta_write > 0) {
+			entry->zipf_write = spdk_zipf_create(entry->size_in_ios, g_zipf_theta_write, rand());
+		} else {
+			entry->zipf_write = NULL;
 		}
 	}
+
 
 	entry->block_size = spdk_nvme_ns_get_extended_sector_size(ns);
 	entry->md_size = spdk_nvme_ns_get_md_size(ns);
@@ -1367,7 +1379,8 @@ unregister_namespaces(void)
 
 	TAILQ_FOREACH_SAFE(entry, &g_namespaces, link, tmp) {
 		TAILQ_REMOVE(&g_namespaces, entry, link);
-		spdk_zipf_free(&entry->zipf);
+		spdk_zipf_free(&entry->zipf_read);
+		spdk_zipf_free(&entry->zipf_write);
 		if (g_use_uring) {
 #ifdef SPDK_CONFIG_URING
 			close(entry->u.uring.fd);
@@ -1482,8 +1495,10 @@ submit_single_io(struct perf_task *task)
 		task->is_read = false;
 	}
 
-	if (entry->zipf && task->is_read) {
-		offset_in_ios = spdk_zipf_generate(entry->zipf);
+	if (entry->zipf_read && task->is_read) {
+		offset_in_ios = spdk_zipf_generate(entry->zipf_read);
+	} else if (entry->zipf_write && !task->is_read) {
+		offset_in_ios = spdk_zipf_generate(entry->zipf_write);
 	} else if (g_is_random) {
 		offset_in_ios = (((uint64_t)rand_r(&worker->seed) << 32) | (uint64_t)rand_r(&worker->seed)) % entry->size_in_ios;
 	} else {
@@ -2438,8 +2453,10 @@ static const struct option g_perf_cmdline_opts[] = {
 	{"max-completion-per-poll",			required_argument,	NULL, PERF_MAX_COMPLETIONS_PER_POLL},
 #define PERF_DISABLE_SQ_CMB	'D'
 	{"disable-sq-cmb",			no_argument,	NULL, PERF_DISABLE_SQ_CMB},
-#define PERF_ZIPF		'F'
-	{"zipf",				required_argument,	NULL, PERF_ZIPF},
+#define PERF_ZIPF_READ		'F'
+	{"zipf-read",				required_argument,	NULL, PERF_ZIPF_READ},
+#define PERF_ZIPF_WRITE		'W'
+	{"zipf-write",				required_argument,	NULL, PERF_ZIPF_WRITE},
 #define PERF_ENABLE_DEBUG	'G'
 	{"enable-debug",			no_argument,	NULL, PERF_ENABLE_DEBUG},
 #define PERF_ENABLE_TCP_HDGST	'H'
@@ -2608,9 +2625,18 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 			g_number_ios = (uint64_t)val2;
 			break;
 		case PERF_ZIPF:
+		case PERF_ZIPF_READ:
 			errno = 0;
-			g_zipf_theta = strtod(optarg, &endptr);
-			if (errno || optarg == endptr || g_zipf_theta < 0) {
+			g_zipf_theta_read = strtod(optarg, &endptr);
+			if (errno || optarg == endptr || g_zipf_theta_read < 0) {
+				fprintf(stderr, "Illegal zipf theta value %s\n", optarg);
+				return 1;
+			}
+			break;
+		case PERF_ZIPF_WRITE:
+			errno = 0;
+			g_zipf_theta_write = strtod(optarg, &endptr);
+			if (errno || optarg == endptr || g_zipf_theta_write < 0) {
 				fprintf(stderr, "Illegal zipf theta value %s\n", optarg);
 				return 1;
 			}
