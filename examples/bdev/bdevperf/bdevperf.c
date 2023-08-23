@@ -1130,7 +1130,7 @@ bdevperf_submit_single(struct bdevperf_job *job, struct bdevperf_task *task)
 	uint32_t first_clear;
 
 	if (job->zipf) {
-		offset_in_ios = spdk_zipf_generate(job->zipf);
+		offset_in_ios = spdk_zipf_generate(job->zipf, rand());
 	} else if (job->is_random) {
 		/* RAND_MAX is only INT32_MAX, so use 2 calls to rand_r to
 		 * get a large enough value to ensure we are issuing I/O
@@ -1713,7 +1713,7 @@ bdevperf_construct_job(struct spdk_bdev *bdev, struct job_config *config,
 	}
 
 	if (job->is_random && g_zipf_theta > 0) {
-		job->zipf = spdk_zipf_create(job->size_in_ios, g_zipf_theta, 0);
+		job->zipf = spdk_zipf_create(job->size_in_ios, g_zipf_theta);
 	}
 
 	if (job->verify) {

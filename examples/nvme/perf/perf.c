@@ -26,6 +26,8 @@
 #include "spdk/zipf.h"
 #include "spdk/nvmf.h"
 
+#include <rte_random.h>
+
 #ifdef SPDK_CONFIG_URING
 #include <liburing.h>
 #endif
@@ -81,8 +83,8 @@ struct ns_entry {
 	uint32_t		block_size;
 	uint32_t		md_size;
 	bool			md_interleave;
-	unsigned int		seed;
-	struct spdk_zipf	*zipf;
+	struct spdk_zipf	*zipf_read;
+	struct spdk_zipf	*zipf_write;
 	bool			pi_loc;
 	enum spdk_nvme_pi_type	pi_type;
 	uint32_t		io_flags;
@@ -111,8 +113,12 @@ static const double g_latency_cutoffs[] = {
 struct ns_worker_stats {
 	uint64_t		io_submitted;
 	uint64_t		io_completed;
+	uint64_t		read_completed;
+	uint64_t		write_completed;
 	uint64_t		last_io_completed;
 	uint64_t		total_tsc;
+	uint64_t		read_tsc;
+	uint64_t		write_tsc;
 	uint64_t		min_tsc;
 	uint64_t		max_tsc;
 	uint64_t		last_tsc;
@@ -159,10 +165,18 @@ struct ns_worker_ctx {
 
 	TAILQ_HEAD(, perf_task)		queued_tasks;
 
-	struct spdk_histogram_data	*histogram;
+	struct spdk_histogram_data	*read_histogram;
+	struct spdk_histogram_data	*write_histogram;
+};
+
+struct worker_thread {
+	TAILQ_HEAD(, ns_worker_ctx)	ns_ctx;
+	TAILQ_ENTRY(worker_thread)	link;
+	unsigned			lcore;
 };
 
 struct perf_task {
+	struct worker_thread	*worker;
 	struct ns_worker_ctx	*ns_ctx;
 	struct iovec		*iovs; /* array of iovecs to transfer. */
 	int			iovcnt; /* Number of iovecs in iovs array. */
@@ -176,12 +190,6 @@ struct perf_task {
 	struct iocb		iocb;
 #endif
 	TAILQ_ENTRY(perf_task)	link;
-};
-
-struct worker_thread {
-	TAILQ_HEAD(, ns_worker_ctx)	ns_ctx;
-	TAILQ_ENTRY(worker_thread)	link;
-	unsigned			lcore;
 };
 
 struct ns_fn_table {
@@ -252,7 +260,8 @@ static bool g_exit;
 static uint32_t g_keep_alive_timeout_in_ms = 10000;
 static bool g_continue_on_error = false;
 static uint32_t g_quiet_count = 1;
-static double g_zipf_theta;
+static double g_zipf_theta_read;
+static double g_zipf_theta_write;
 /* Set default io_queue_size to UINT16_MAX, NVMe driver will then reduce this
  * to MQES to maximize the io_queue_size as much as possible.
  */
@@ -296,7 +305,7 @@ static struct spdk_pci_addr g_allowed_pci_addr[MAX_ALLOWED_PCI_DEVICE_NUM];
 
 struct trid_entry {
 	struct spdk_nvme_transport_id	trid;
-	uint16_t			nsid;
+	uint32_t			nsid;
 	char				hostnqn[SPDK_NVMF_NQN_MAX_LEN + 1];
 	TAILQ_ENTRY(trid_entry)		tailq;
 };
@@ -770,8 +779,15 @@ register_file(const char *path)
 
 	if (g_is_random) {
 		entry->seed = rand();
-		if (g_zipf_theta > 0) {
-			entry->zipf = spdk_zipf_create(entry->size_in_ios, g_zipf_theta, 0);
+		if (g_zipf_theta_read > 0) {
+			entry->zipf_read = spdk_zipf_create(entry->size_in_ios, g_zipf_theta_read);
+		} else {
+			entry->zipf_read = NULL;
+		}
+		if (g_zipf_theta_write > 0) {
+			entry->zipf_write = spdk_zipf_create(entry->size_in_ios, g_zipf_theta_write);
+		} else {
+			entry->zipf_write = NULL;
 		}
 	}
 
@@ -1302,10 +1318,18 @@ register_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns)
 
 	if (g_is_random) {
 		entry->seed = rand();
-		if (g_zipf_theta > 0) {
-			entry->zipf = spdk_zipf_create(entry->size_in_ios, g_zipf_theta, 0);
+		if (g_zipf_theta_read > 0) {
+			entry->zipf_read = spdk_zipf_create(entry->size_in_ios, g_zipf_theta_read);
+		} else {
+			entry->zipf_read = NULL;
+		}
+		if (g_zipf_theta_write > 0) {
+			entry->zipf_write = spdk_zipf_create(entry->size_in_ios, g_zipf_theta_write);
+		} else {
+			entry->zipf_write = NULL;
 		}
 	}
+
 
 	entry->block_size = spdk_nvme_ns_get_extended_sector_size(ns);
 	entry->md_size = spdk_nvme_ns_get_md_size(ns);
@@ -1356,7 +1380,8 @@ unregister_namespaces(void)
 
 	TAILQ_FOREACH_SAFE(entry, &g_namespaces, link, tmp) {
 		TAILQ_REMOVE(&g_namespaces, entry, link);
-		spdk_zipf_free(&entry->zipf);
+		spdk_zipf_free(&entry->zipf_read);
+		spdk_zipf_free(&entry->zipf_write);
 		if (g_use_uring) {
 #ifdef SPDK_CONFIG_URING
 			close(entry->u.uring.fd);
@@ -1463,11 +1488,19 @@ submit_single_io(struct perf_task *task)
 	struct ns_entry		*entry = ns_ctx->entry;
 
 	assert(!ns_ctx->is_draining);
+	if ((g_rw_percentage == 100) ||
+	    (g_rw_percentage != 0 && ((int)(rte_rand() % 100) < g_rw_percentage))) {
+		task->is_read = true;
+	} else {
+		task->is_read = false;
+	}
 
-	if (entry->zipf) {
-		offset_in_ios = spdk_zipf_generate(entry->zipf);
+	if (entry->zipf_read && task->is_read) {
+		offset_in_ios = spdk_zipf_generate(entry->zipf_read, rte_rand());
+	} else if (entry->zipf_write && !task->is_read) {
+		offset_in_ios = spdk_zipf_generate(entry->zipf_write, rte_rand());
 	} else if (g_is_random) {
-		offset_in_ios = rand_r(&entry->seed) % entry->size_in_ios;
+		offset_in_ios = rte_rand() % entry->size_in_ios;
 	} else {
 		offset_in_ios = ns_ctx->offset_in_ios++;
 		if (ns_ctx->offset_in_ios == entry->size_in_ios) {
@@ -1476,13 +1509,6 @@ submit_single_io(struct perf_task *task)
 	}
 
 	task->submit_tsc = spdk_get_ticks();
-
-	if ((g_rw_percentage == 100) ||
-	    (g_rw_percentage != 0 && ((rand_r(&entry->seed) % 100) < g_rw_percentage))) {
-		task->is_read = true;
-	} else {
-		task->is_read = false;
-	}
 
 	rc = entry->fn_table->submit_io(task, ns_ctx, entry, offset_in_ios);
 
@@ -1519,8 +1545,18 @@ task_complete(struct perf_task *task)
 	entry = ns_ctx->entry;
 	ns_ctx->current_queue_depth--;
 	ns_ctx->stats.io_completed++;
+	if (task->is_read) {
+		ns_ctx->stats.read_completed++;
+	} else {
+		ns_ctx->stats.write_completed++;
+	}
 	tsc_diff = spdk_get_ticks() - task->submit_tsc;
 	ns_ctx->stats.total_tsc += tsc_diff;
+	if (task->is_read) {
+		ns_ctx->stats.read_tsc += tsc_diff;
+	} else {
+		ns_ctx->stats.write_tsc += tsc_diff;
+	}
 	if (spdk_unlikely(ns_ctx->stats.min_tsc > tsc_diff)) {
 		ns_ctx->stats.min_tsc = tsc_diff;
 	}
@@ -1528,7 +1564,11 @@ task_complete(struct perf_task *task)
 		ns_ctx->stats.max_tsc = tsc_diff;
 	}
 	if (spdk_unlikely(g_latency_sw_tracking_level > 0)) {
-		spdk_histogram_data_tally(ns_ctx->histogram, tsc_diff);
+		if (task->is_read) {
+			spdk_histogram_data_tally(ns_ctx->read_histogram, tsc_diff);
+		} else {
+			spdk_histogram_data_tally(ns_ctx->write_histogram, tsc_diff);
+		}
 	}
 
 	if (spdk_unlikely(entry->md_size > 0)) {
@@ -1577,7 +1617,7 @@ io_complete(void *ctx, const struct spdk_nvme_cpl *cpl)
 }
 
 static struct perf_task *
-allocate_task(struct ns_worker_ctx *ns_ctx, int queue_depth)
+allocate_task(struct worker_thread *worker, struct ns_worker_ctx *ns_ctx, int queue_depth)
 {
 	struct perf_task *task;
 
@@ -1590,17 +1630,18 @@ allocate_task(struct ns_worker_ctx *ns_ctx, int queue_depth)
 	ns_ctx->entry->fn_table->setup_payload(task, queue_depth % 8 + 1);
 
 	task->ns_ctx = ns_ctx;
+	task->worker = worker;
 
 	return task;
 }
 
 static void
-submit_io(struct ns_worker_ctx *ns_ctx, int queue_depth)
+submit_io(struct worker_thread *worker, struct ns_worker_ctx *ns_ctx, int queue_depth)
 {
 	struct perf_task *task;
 
 	while (queue_depth-- > 0) {
-		task = allocate_task(ns_ctx, queue_depth);
+		task = allocate_task(worker, ns_ctx, queue_depth);
 		submit_single_io(task);
 	}
 }
@@ -1729,7 +1770,7 @@ work_fn(void *arg)
 
 	/* Submit initial I/O for each namespace. */
 	TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
-		submit_io(ns_ctx, g_queue_depth);
+		submit_io(worker, ns_ctx, g_queue_depth);
 	}
 
 	while (spdk_likely(!g_exit)) {
@@ -1986,21 +2027,23 @@ print_bucket(void *ctx, uint64_t start, uint64_t end, uint64_t count,
 static void
 print_performance(void)
 {
-	uint64_t total_io_completed, total_io_tsc;
-	double io_per_second, mb_per_second, average_latency, min_latency, max_latency;
-	double sum_ave_latency, min_latency_so_far, max_latency_so_far;
-	double total_io_per_second, total_mb_per_second;
+	uint64_t total_read_completed, total_write_completed, total_read_tsc, total_write_tsc;
+	double read_per_second, read_mb_per_second, total_read_per_second, total_read_mb_per_second;
+	double write_per_second, write_mb_per_second, total_write_per_second, total_write_mb_per_second;
+	double read_average_latency, write_average_latency;
 	int ns_count;
 	struct worker_thread	*worker;
 	struct ns_worker_ctx	*ns_ctx;
 	uint32_t max_strlen;
 
-	total_io_per_second = 0;
-	total_mb_per_second = 0;
-	total_io_completed = 0;
-	total_io_tsc = 0;
-	min_latency_so_far = (double)UINT64_MAX;
-	max_latency_so_far = 0;
+	total_read_per_second = 0;
+	total_read_mb_per_second = 0;
+	total_read_completed = 0;
+	total_read_tsc = 0;
+	total_write_per_second = 0;
+	total_write_mb_per_second = 0;
+	total_write_completed = 0;
+	total_write_tsc = 0;
 	ns_count = 0;
 
 	max_strlen = 0;
@@ -2012,49 +2055,51 @@ print_performance(void)
 
 	printf("========================================================\n");
 	printf("%*s\n", max_strlen + 60, "Latency(us)");
-	printf("%-*s: %10s %10s %10s %10s %10s\n",
-	       max_strlen + 13, "Device Information", "IOPS", "MiB/s", "Average", "min", "max");
+	printf("%-*s: %10s %10s %10s %10s %10s %10s\n",
+	       max_strlen + 13, "Device Information", "R IOPS", "R MiB/s", "R Average", "W IOPS", "W MiB/s", "W Average");
 
 	TAILQ_FOREACH(worker, &g_workers, link) {
 		TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
 			if (ns_ctx->stats.io_completed != 0) {
-				io_per_second = (double)ns_ctx->stats.io_completed * 1000 * 1000 / g_elapsed_time_in_usec;
-				mb_per_second = io_per_second * g_io_size_bytes / (1024 * 1024);
-				average_latency = ((double)ns_ctx->stats.total_tsc / ns_ctx->stats.io_completed) * 1000 * 1000 /
+				read_per_second = (double)ns_ctx->stats.read_completed * 1000 * 1000 / g_elapsed_time_in_usec;
+				read_mb_per_second = read_per_second * g_io_size_bytes / (1024 * 1024);
+				read_average_latency = ((double)ns_ctx->stats.read_tsc / ns_ctx->stats.read_completed) * 1000 * 1000 /
 						  g_tsc_rate;
-				min_latency = (double)ns_ctx->stats.min_tsc * 1000 * 1000 / g_tsc_rate;
-				if (min_latency < min_latency_so_far) {
-					min_latency_so_far = min_latency;
-				}
+				write_per_second = (double)ns_ctx->stats.write_completed * 1000 * 1000 / g_elapsed_time_in_usec;
+				write_mb_per_second = write_per_second * g_io_size_bytes / (1024 * 1024);
+				write_average_latency = ((double)ns_ctx->stats.write_tsc / ns_ctx->stats.write_completed) * 1000 * 1000 /
+						  g_tsc_rate;
 
-				max_latency = (double)ns_ctx->stats.max_tsc * 1000 * 1000 / g_tsc_rate;
-				if (max_latency > max_latency_so_far) {
-					max_latency_so_far = max_latency;
-				}
-
-				printf("%-*.*s from core %2u: %10.2f %10.2f %10.2f %10.2f %10.2f\n",
+				printf("%-*.*s from core %2u: %10.2f %10.2f %10.2f %10.2f %10.2f %10.2f\n",
 				       max_strlen, max_strlen, ns_ctx->entry->name, worker->lcore,
-				       io_per_second, mb_per_second,
-				       average_latency, min_latency, max_latency);
-				total_io_per_second += io_per_second;
-				total_mb_per_second += mb_per_second;
-				total_io_completed += ns_ctx->stats.io_completed;
-				total_io_tsc += ns_ctx->stats.total_tsc;
+				       read_per_second, read_mb_per_second, read_average_latency,
+				       write_per_second, write_mb_per_second, write_average_latency);
+
+				total_read_per_second += read_per_second;
+				total_read_mb_per_second += read_mb_per_second;
+				total_read_completed += ns_ctx->stats.read_completed;
+				total_read_tsc += ns_ctx->stats.read_tsc;
+				total_write_per_second += write_per_second;
+				total_write_mb_per_second += write_mb_per_second;
+				total_write_completed += ns_ctx->stats.write_completed;
+				total_write_tsc += ns_ctx->stats.write_tsc;
 				ns_count++;
 			}
 		}
 	}
 
-	if (ns_count != 0 && total_io_completed) {
-		sum_ave_latency = ((double)total_io_tsc / total_io_completed) * 1000 * 1000 / g_tsc_rate;
+	if (ns_count != 0 && (total_read_completed || total_write_completed)) {
+		read_average_latency = ((double)total_read_tsc / total_read_completed) * 1000 * 1000 / g_tsc_rate;
+		write_average_latency = ((double)total_write_tsc / total_write_completed) * 1000 * 1000 / g_tsc_rate;
 		printf("========================================================\n");
-		printf("%-*s: %10.2f %10.2f %10.2f %10.2f %10.2f\n",
-		       max_strlen + 13, "Total", total_io_per_second, total_mb_per_second,
-		       sum_ave_latency, min_latency_so_far, max_latency_so_far);
+		printf("%-*s: %10.2f %10.2f %10.2f %10.2f %10.2f %10.2f\n",
+		       max_strlen + 13, "Total",
+		       total_read_per_second, total_read_mb_per_second, read_average_latency,
+		       total_write_per_second, total_write_mb_per_second, write_average_latency);
 		printf("\n");
 	}
 
-	if (g_latency_sw_tracking_level == 0 || total_io_completed == 0) {
+	if (g_latency_sw_tracking_level == 0 || (total_read_completed == 0 && total_write_completed == 0)) {
 		return;
 	}
 
@@ -2065,7 +2110,10 @@ print_performance(void)
 			printf("Summary latency data for %-43.43s from core %u:\n", ns_ctx->entry->name, worker->lcore);
 			printf("=================================================================================\n");
 
-			spdk_histogram_data_iterate(ns_ctx->histogram, check_cutoff, &cutoff);
+			printf("Reads:\n");
+			spdk_histogram_data_iterate(ns_ctx->read_histogram, check_cutoff, &cutoff);
+			printf("Writes:\n");
+			spdk_histogram_data_iterate(ns_ctx->write_histogram, check_cutoff, &cutoff);
 
 			printf("\n");
 		}
@@ -2081,7 +2129,10 @@ print_performance(void)
 			printf("==============================================================================\n");
 			printf("       Range in us     Cumulative    IO count\n");
 
-			spdk_histogram_data_iterate(ns_ctx->histogram, print_bucket, NULL);
+			printf("Reads:\n");
+			spdk_histogram_data_iterate(ns_ctx->read_histogram, print_bucket, NULL);
+			printf("Writes:\n");
+			spdk_histogram_data_iterate(ns_ctx->write_histogram, print_bucket, NULL);
 			printf("\n");
 		}
 	}
@@ -2201,15 +2252,15 @@ add_trid(const char *trid_str)
 
 	ns = strcasestr(trid_str, "ns:");
 	if (ns) {
-		char nsid_str[6]; /* 5 digits maximum in an nsid */
+		char nsid_str[7]; /* 6 digits maximum in an nsid */
 		int len;
 		int nsid;
 
 		ns += 3;
 
 		len = strcspn(ns, " \t\n");
-		if (len > 5) {
-			fprintf(stderr, "NVMe namespace IDs must be 5 digits or less\n");
+		if (len > 6) {
+			fprintf(stderr, "NVMe namespace IDs must be 6 digits or less\n");
 			free(trid_entry);
 			return 1;
 		}
@@ -2218,13 +2269,13 @@ add_trid(const char *trid_str)
 		nsid_str[len] = '\0';
 
 		nsid = spdk_strtol(nsid_str, 10);
-		if (nsid <= 0 || nsid > 65535) {
-			fprintf(stderr, "NVMe namespace IDs must be less than 65536 and greater than 0\n");
+		if (nsid <= 0 || nsid > 131072) {
+			fprintf(stderr, "NVMe namespace IDs must be less than 131072 and greater than 0\n");
 			free(trid_entry);
 			return 1;
 		}
 
-		trid_entry->nsid = (uint16_t)nsid;
+		trid_entry->nsid = nsid;
 	}
 
 	hostnqn = strcasestr(trid_str, "hostnqn:");
@@ -2402,8 +2453,10 @@ static const struct option g_perf_cmdline_opts[] = {
 	{"max-completion-per-poll",			required_argument,	NULL, PERF_MAX_COMPLETIONS_PER_POLL},
 #define PERF_DISABLE_SQ_CMB	'D'
 	{"disable-sq-cmb",			no_argument,	NULL, PERF_DISABLE_SQ_CMB},
-#define PERF_ZIPF		'F'
-	{"zipf",				required_argument,	NULL, PERF_ZIPF},
+#define PERF_ZIPF_READ		'F'
+	{"zipf-read",				required_argument,	NULL, PERF_ZIPF_READ},
+#define PERF_ZIPF_WRITE		'W'
+	{"zipf-write",				required_argument,	NULL, PERF_ZIPF_WRITE},
 #define PERF_ENABLE_DEBUG	'G'
 	{"enable-debug",			no_argument,	NULL, PERF_ENABLE_DEBUG},
 #define PERF_ENABLE_TCP_HDGST	'H'
@@ -2572,9 +2625,18 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 			g_number_ios = (uint64_t)val2;
 			break;
 		case PERF_ZIPF:
+		case PERF_ZIPF_READ:
 			errno = 0;
-			g_zipf_theta = strtod(optarg, &endptr);
-			if (errno || optarg == endptr || g_zipf_theta < 0) {
+			g_zipf_theta_read = strtod(optarg, &endptr);
+			if (errno || optarg == endptr || g_zipf_theta_read < 0) {
+				fprintf(stderr, "Illegal zipf theta value %s\n", optarg);
+				return 1;
+			}
+			break;
+		case PERF_ZIPF_WRITE:
+			errno = 0;
+			g_zipf_theta_write = strtod(optarg, &endptr);
+			if (errno || optarg == endptr || g_zipf_theta_write < 0) {
 				fprintf(stderr, "Illegal zipf theta value %s\n", optarg);
 				return 1;
 			}
@@ -2881,7 +2943,8 @@ unregister_workers(void)
 
 		TAILQ_FOREACH_SAFE(ns_ctx, &worker->ns_ctx, link, tmp_ns_ctx) {
 			TAILQ_REMOVE(&worker->ns_ctx, ns_ctx, link);
-			spdk_histogram_data_free(ns_ctx->histogram);
+			spdk_histogram_data_free(ns_ctx->read_histogram);
+			spdk_histogram_data_free(ns_ctx->write_histogram);
 			free(ns_ctx);
 		}
 
@@ -3160,8 +3223,9 @@ main(int argc, char **argv)
 	struct spdk_env_opts opts;
 	pthread_t thread_id = 0;
 
-	/* Use the runtime PID to set the random seed */
-	srand(getpid());
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	rte_srand((uint64_t)now.tv_sec + ((uint64_t)now.tv_nsec * 1000000000));
 
 	spdk_env_opts_init(&opts);
 	opts.name = "perf";
