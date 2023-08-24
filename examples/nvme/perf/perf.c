@@ -778,7 +778,6 @@ register_file(const char *path)
 	entry->io_size_blocks = g_io_size_bytes / blklen;
 
 	if (g_is_random) {
-		entry->seed = rand();
 		if (g_zipf_theta_read > 0) {
 			entry->zipf_read = spdk_zipf_create(entry->size_in_ios, g_zipf_theta_read);
 		} else {
@@ -1317,7 +1316,6 @@ register_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns)
 	entry->io_size_blocks = g_io_size_bytes / sector_size;
 
 	if (g_is_random) {
-		entry->seed = rand();
 		if (g_zipf_theta_read > 0) {
 			entry->zipf_read = spdk_zipf_create(entry->size_in_ios, g_zipf_theta_read);
 		} else {
@@ -1354,7 +1352,8 @@ register_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns)
 		printf("WARNING: IO size %u (-o) is not a multiple of nsid %u sector size %u."
 		       " Removing this ns from test\n", g_io_size_bytes, spdk_nvme_ns_get_id(ns), entry->block_size);
 		g_warn = true;
-		spdk_zipf_free(&entry->zipf);
+		spdk_zipf_free(&entry->zipf_read);
+		spdk_zipf_free(&entry->zipf_write);
 		free(entry);
 		return;
 	}
@@ -1828,7 +1827,8 @@ work_fn(void *arg)
 				TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
 					memset(&ns_ctx->stats, 0, sizeof(ns_ctx->stats));
 					ns_ctx->stats.min_tsc = UINT64_MAX;
-					spdk_histogram_data_reset(ns_ctx->histogram);
+					spdk_histogram_data_reset(ns_ctx->read_histogram);
+					spdk_histogram_data_reset(ns_ctx->write_histogram);
 				}
 
 				if (worker->lcore == g_main_core && isatty(STDOUT_FILENO)) {
@@ -2624,7 +2624,6 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 
 			g_number_ios = (uint64_t)val2;
 			break;
-		case PERF_ZIPF:
 		case PERF_ZIPF_READ:
 			errno = 0;
 			g_zipf_theta_read = strtod(optarg, &endptr);
@@ -3099,7 +3098,8 @@ allocate_ns_worker(struct ns_entry *entry, struct worker_thread *worker)
 	printf("Associating %s with lcore %d\n", entry->name, worker->lcore);
 	ns_ctx->stats.min_tsc = UINT64_MAX;
 	ns_ctx->entry = entry;
-	ns_ctx->histogram = spdk_histogram_data_alloc();
+	ns_ctx->read_histogram = spdk_histogram_data_alloc();
+	ns_ctx->write_histogram = spdk_histogram_data_alloc();
 	TAILQ_INSERT_TAIL(&worker->ns_ctx, ns_ctx, link);
 
 	return 0;
